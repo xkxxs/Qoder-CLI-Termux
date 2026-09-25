@@ -15,7 +15,7 @@
 #     3. 生成 wrapper (处理 LD_PRELOAD / 证书 / DNS / 自动更新) 与 qoder dispatcher
 #
 # 用法:
-#   bash <(curl -fsSL https://raw.githubusercontent.com/<USER>/Qoder-CLI-Termux/main/install.sh)
+#   bash <(curl -fsSL https://raw.githubusercontent.com/xkxxs/Qoder-CLI-Termux/main/install.sh)
 #   bash <(curl -fsSL …/install.sh) --uninstall
 # ============================================================
 set -euo pipefail
