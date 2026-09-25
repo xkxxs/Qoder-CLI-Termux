@@ -35,6 +35,19 @@
 bash <(curl -fsSL https://raw.githubusercontent.com/xkxxs/Qoder-CLI-Termux/main/install.sh)
 ```
 
+国内网络常常拉不动 `raw.githubusercontent.com`（时好时坏或直接超时），改用镜像：
+
+```bash
+# jsDelivr CDN
+bash <(curl -fsSL https://cdn.jsdelivr.net/gh/xkxxs/Qoder-CLI-Termux@main/install.sh)
+
+# 或 gh-proxy
+bash <(curl -fsSL https://gh-proxy.com/https://raw.githubusercontent.com/xkxxs/Qoder-CLI-Termux/main/install.sh)
+```
+
+> 镜像只是搬运 `install.sh` 本身；脚本安装的 Qoder CLI 二进制来自官方 OSS
+> （`qoder-ide.oss-accelerate.aliyuncs.com`），musl 运行库来自 Alpine 镜像，都不经 GitHub。
+
 重跑即更新（幂等）；加 `--uninstall` 卸载。
 
 ## 脚本做了什么
