@@ -44,10 +44,13 @@ ASSET="qodercli-linux-arm64-musl.tar.gz"
 INTERP="$PREFIX/lib/ld-musl-aarch64.so.1"
 LIB_DIR="$PREFIX/lib/musl"
 RUNPATH="$LIB_DIR:$PREFIX/lib"
-ALPINE="https://dl-cdn.alpinelinux.org/alpine"
-MUSL_APK="$ALPINE/edge/main/aarch64/musl-1.2.6-r2.apk"
-LIBGCC_APK="$ALPINE/v3.20/main/aarch64/libgcc-13.2.1_git20240309-r1.apk"
-LIBSTDCXX_APK="$ALPINE/v3.20/main/aarch64/libstdc++-13.2.1_git20240309-r1.apk"
+# Alpine 镜像 (动态解析版本, 不硬编码 — 见下方 Alpine 源说明)
+ALPINE_MIRRORS=(
+    "https://mirrors.tuna.tsinghua.edu.cn/alpine/latest-stable/main/aarch64"
+    "https://mirrors.aliyun.com/alpine/latest-stable/main/aarch64"
+    "https://mirrors.ustc.edu.cn/alpine/latest-stable/main/aarch64"
+    "https://dl-cdn.alpinelinux.org/alpine/latest-stable/main/aarch64"
+)
 
 # DNS 组件: 转发器仍叫 dns53.js (让 codex/opencode 的 pgrep 也能识别, 避免重复拉起),
 # 但放在 ~/.qoder/bin 下, 不覆盖其他项目 ~/.local/bin/dns53.js
@@ -114,20 +117,63 @@ install_dependencies() {
 # ---------- musl 运行库 (Alpine) ----------
 # musl 变体是动态链接: 需要 ld-musl-aarch64.so.1 + libstdc++.so.6 + libgcc_s.so.1。
 # 与 opencode-termux 共用 $PREFIX/lib/musl, 已存在则跳过 (幂等)。
+# ---------- Alpine 源: 动态版本 + 多镜像回退 ----------
+# 不能硬编码 apk 版本号: Alpine 的 edge 是滚动分支, 旧版本会被直接轮掉
+# (musl-1.2.6-r2 在 edge 已经 404 了), 所以固定用 latest-stable 分支,
+# 并从 APKINDEX.tar.gz (解压出来是纯文本索引) 取当前版本号。
+ALPINE_BASE=""
+
+apk_mirror_host() { local h="${1#https://}"; printf '%s' "${h%%/*}"; }
+
+# $1=索引保存路径; 成功后把选中的镜像放进 ALPINE_BASE
+alpine_select_mirror() {
+    local m
+    for m in "${ALPINE_MIRRORS[@]}"; do
+        if curl -fsSL --connect-timeout 8 --max-time 30 "$m/APKINDEX.tar.gz" -o "$1" 2>/dev/null; then
+            ALPINE_BASE="$m"
+            ok "Alpine 镜像: $(apk_mirror_host "$m")"
+            return 0
+        fi
+    done
+    fail "所有 Alpine 镜像都取不到 APKINDEX (网络问题?)"
+}
+
+# $1=索引路径 $2=包名 → 输出当前版本号
+alpine_version() {
+    tar -xzOf "$1" APKINDEX 2>/dev/null \
+        | awk -F: -v p="$2" '$1=="P" && $2==p {f=1; next} f && $1=="V" {print $2; exit}'
+}
+
+# $1=索引路径 $2=包名 $3=输出文件
+alpine_fetch_apk() {
+    local ver m
+    ver="$(alpine_version "$1" "$2")"
+    [ -n "$ver" ] || fail "APKINDEX 里解析不到 $2 的版本号"
+    for m in "${ALPINE_MIRRORS[@]}"; do
+        if curl -fsSL --connect-timeout 10 --max-time 120 "$m/$2-$ver.apk" -o "$3" 2>/dev/null; then
+            info "$2-$ver.apk ← $(apk_mirror_host "$m")"
+            return 0
+        fi
+    done
+    fail "$2.apk 下载失败 (已试 ${#ALPINE_MIRRORS[@]} 个镜像)"
+}
+
 install_musl_libs() {
     if [ -x "$INTERP" ] && [ -f "$LIB_DIR/libstdc++.so.6" ] && [ -f "$LIB_DIR/libgcc_s.so.1" ]; then
         ok "musl 运行库已就绪 (ld-musl + libstdc++ + libgcc)"
         return 0
     fi
 
-    local work
+    local work idx
     work=$(mktemp -d "${TMPDIR:-$PREFIX/tmp}/musl.XXXXXX")
+    idx="$work/APKINDEX.tar.gz"
     # shellcheck disable=SC2064
     trap "rm -rf '$work'" RETURN
 
     if [ ! -x "$INTERP" ]; then
         info "获取 musl 动态链接器 (Alpine musl 包)…"
-        curl -fsSL --connect-timeout 15 --max-time 120 "$MUSL_APK" -o "$work/musl.apk" || fail "musl.apk 下载失败"
+        alpine_select_mirror "$idx"
+        alpine_fetch_apk "$idx" musl "$work/musl.apk"
         (cd "$work" && tar xzf musl.apk) || fail "musl.apk 解压失败"
         [ -f "$work/lib/ld-musl-aarch64.so.1" ] || fail "musl.apk 内容异常"
         cp "$work/lib/ld-musl-aarch64.so.1" "$PREFIX/lib/"
@@ -137,8 +183,9 @@ install_musl_libs() {
 
     info "获取 C++ 运行库 (Alpine libgcc + libstdc++)…"
     mkdir -p "$LIB_DIR"
-    curl -fsSL --connect-timeout 15 --max-time 120 "$LIBGCC_APK" -o "$work/libgcc.apk" || fail "libgcc.apk 下载失败"
-    curl -fsSL --connect-timeout 15 --max-time 120 "$LIBSTDCXX_APK" -o "$work/libstdcxx.apk" || fail "libstdc++.apk 下载失败"
+    [ -s "$idx" ] || alpine_select_mirror "$idx"
+    alpine_fetch_apk "$idx" libgcc "$work/libgcc.apk"
+    alpine_fetch_apk "$idx" "libstdc++" "$work/libstdcxx.apk"
     (cd "$work" && tar xzf libgcc.apk && tar xzf libstdcxx.apk) || fail "C++ 库解压失败"
     cp "$work/usr/lib/libgcc_s.so.1" "$LIB_DIR/" || fail "libgcc_s.so.1 拷贝失败"
     cp "$work/usr/lib"/libstdc++.so.6* "$LIB_DIR/" 2>/dev/null || true
