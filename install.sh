@@ -268,7 +268,8 @@ install_qoder_binary() {
     trap "rm -rf '$work'" RETURN
 
     info "下载 $ASSET (约 74MB, 慢网请耐心)…"
-    curl -fsSL --retry 2 --retry-delay 2 --connect-timeout 15 --max-time 600 "$url" -o "$work/$ASSET" \
+    # 不用 -s: 保留 curl 的进度条 (大文件下载时不会让人以为卡死)
+    curl -fSL --progress-bar --retry 2 --retry-delay 2 --connect-timeout 15 --max-time 600 "$url" -o "$work/$ASSET" \
         || fail "下载失败: $url"
     if ! verify_sha256 "$work/$ASSET" "$sha"; then
         rm -f "$work/$ASSET"
@@ -1059,7 +1060,7 @@ do_update() {
     work=$(mktemp -d "$TMP_BASE/qoder.XXXXXX")
     trap "rm -rf '$work'" RETURN
 
-    if ! curl -fsSL --retry 2 --retry-delay 2 --connect-timeout 15 --max-time 600 "$url" -o "$work/$ASSET"; then
+    if ! curl -fSL --progress-bar --retry 2 --retry-delay 2 --connect-timeout 15 --max-time 600 "$url" -o "$work/$ASSET"; then
         echo "!! 下载失败" >&2; return 1
     fi
     if ! verify_sha256 "$work/$ASSET" "$sha"; then
