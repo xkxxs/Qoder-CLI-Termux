@@ -28,6 +28,7 @@ QODER_DIR="$HOME_DIR/.qoder"
 BIN_DIR="$QODER_DIR/bin/qodercli"
 REAL_BIN="$BIN_DIR/qodercli"
 VERSION_FILE="$BIN_DIR/.version"
+MODE_FILE="$BIN_DIR/.mode"       # native (patchelf) / proot-bind
 TMP_BASE="$QODER_DIR/tmp"
 WRAPPER="$HOME_DIR/.local/bin/qodercli"
 DISPATCHER="$HOME_DIR/.local/bin/qoder"
@@ -323,6 +324,28 @@ verify_sha256() {
     [ "$got" = "$expect" ]
 }
 
+# ---------- proot 绑定运行 (patchelf 靠不住时的兜底) ----------
+# Termux 的 patchelf 0.19.2 会把某些大体积 musl 二进制改坏 (打完补丁一跑就
+# SIGSEGV, opencode V2 上已复现)。此时二进制保持官方原样, 由 proot 把 musl
+# loader / 运行库绑到它原本要找的标准路径 —— 完全不需要 patchelf。
+proot_bind_run() {
+    local bin="$1"; shift
+    local opts=(-b "${INTERP}:/lib/ld-musl-aarch64.so.1")
+    # 注意: RUNPATH 是冒号分隔的列表 ("$LIB_DIR:$PREFIX/lib"), 不能拿它拼
+    # 文件路径, 必须用单个目录 LIB_DIR
+    if [ -f "${LIB_DIR}/libstdc++.so.6" ]; then
+        opts+=(-b "${LIB_DIR}/libstdc++.so.6:/usr/lib/libstdc++.so.6")
+    fi
+    if [ -f "${LIB_DIR}/libgcc_s.so.1" ]; then
+        opts+=(-b "${LIB_DIR}/libgcc_s.so.1:/usr/lib/libgcc_s.so.1")
+    fi
+    if [ -f "${PREFIX}/etc/resolv.conf" ]; then
+        opts+=(-b "${PREFIX}/etc/resolv.conf:/etc/resolv.conf")
+    fi
+    # timeout 是外部命令, 调不了函数, 所以放在函数内部
+    timeout 60 proot "${opts[@]}" env -u LD_PRELOAD "$bin" "$@"
+}
+
 # ---------- 下载 → patchelf → 试跑 → 换入 ----------
 # 成功返回 0 并把新二进制安装到 $REAL_BIN; 失败返回 1 且不动现有版本
 install_qoder_binary() {
@@ -367,23 +390,51 @@ install_qoder_binary() {
     [ -n "$new" ] && [ -f "$new" ] || fail "包内未找到 qodercli 二进制"
     chmod 755 "$new"
 
+    local mode=native
+    cp "$new" "$work/qodercli.orig"   # 留一份未打补丁的
+
     info "改写 ELF: 解释器 → $INTERP; RPATH → $RUNPATH"
-    patchelf --set-interpreter "$INTERP" "$new" || fail "patchelf 设置解释器失败"
+    patchelf --set-interpreter "$INTERP" "$new" \
+        || warn "patchelf 设置解释器失败 (将改用 proot 绑定模式)"
     # musl loader 一定支持 DT_RPATH; DT_RUNPATH 的支持取决于 musl 版本, 故强制 RPATH
-    patchelf --force-rpath --set-rpath "$RUNPATH" "$new" || fail "patchelf 设置 RPATH 失败"
+    patchelf --force-rpath --set-rpath "$RUNPATH" "$new" \
+        || warn "patchelf 设置 RPATH 失败 (将改用 proot 绑定模式)"
 
     # 试跑: 必须清掉 LD_PRELOAD (termux-exec 的 ld-preload 是 bionic 链接, musl 加载会 exit 127)
     # --version 不联网, 因此 DNS 未就绪也不会误判
     info "试跑新二进制…"
-    if ! timeout 30 env -u LD_PRELOAD "$new" --version 2>&1 | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+'; then
-        fail "新二进制试跑失败, 保留现有版本。若报 'Error relocating', 请检查 musl 运行库"
+    # 注意: 不能写成 `cmd | grep -q` —— grep 匹配到就退出, 写端会被 SIGPIPE
+    # 杀掉, 在 pipefail 下整条管道算失败, 导致误判。先捕获再匹配。
+    local trial_out=""
+    trial_out="$(timeout 30 env -u LD_PRELOAD "$new" --version 2>&1)" || true
+    if ! printf '%s' "$trial_out" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+'; then
+        warn "patchelf 后的二进制跑不起来 (Termux patchelf 0.19.2 会改坏大体积 musl 二进制)"
+        info "改用 proot 绑定运行库模式 (二进制保持官方原样, 由 proot 绑 musl loader)"
+        if ! command -v proot >/dev/null 2>&1; then
+            info "安装 proot…"
+            pkg install -y proot || true
+        fi
+        command -v proot >/dev/null 2>&1 \
+            || fail "该模式需要 proot, 但安装失败。请手动: pkg install proot"
+        chmod 755 "$work/qodercli.orig"
+        trial_out="$(proot_bind_run "$work/qodercli.orig" --version 2>&1)" || true
+        if printf '%s' "$trial_out" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+'; then
+            new="$work/qodercli.orig"
+            mode=proot-bind
+            ok "proot 绑定模式验证通过"
+        else
+            warn "proot 绑定模式的实际输出:"
+            printf '%s\n' "$trial_out" | head -5 | sed 's/^/    /'
+            fail "新二进制试跑失败 (patchelf 与 proot 绑定两种模式都不行), 保留现有版本"
+        fi
     fi
 
     mkdir -p "$BIN_DIR"
     mv -f "$new" "$REAL_BIN"
     chmod 755 "$REAL_BIN"
     printf '%s\n' "$latest" > "$VERSION_FILE"
-    ok "Qoder CLI v$latest 已安装: $REAL_BIN"
+    printf '%s\n' "$mode" > "$MODE_FILE"
+    ok "Qoder CLI v$latest 已安装: $REAL_BIN (运行模式: $mode)"
 }
 
 # ---------- DNS 组件 ----------
@@ -1086,6 +1137,7 @@ set -euo pipefail
 PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
 BIN="$HOME/.qoder/bin/qodercli/qodercli"
 VERSION_FILE="$HOME/.qoder/bin/qodercli/.version"
+MODE_FILE="$(dirname "$BIN")/.mode"   # native (patchelf) / proot-bind
 OFFICIAL_ENTRY="$HOME/.qoder/entry/qoder"
 DISPATCHER="$HOME/.local/bin/qoder"
 TMP_BASE="$HOME/.qoder/tmp"
@@ -1179,6 +1231,15 @@ sync_dispatcher() {
 
 case "${1:-}" in
     --version|-v)
+        # proot-bind 模式下二进制未打补丁, 必须经 proot 绑定才能跑
+        # (否则报 "No such file or directory", 其实是 interpreter 不在标准路径)
+        if [ "$(cat "$MODE_FILE" 2>/dev/null || echo native)" = "proot-bind" ] \
+           && command -v proot >/dev/null 2>&1; then
+            exec proot -b "${INTERP}:/lib/ld-musl-aarch64.so.1" \
+                -b "${PREFIX}/lib/musl/libstdc++.so.6:/usr/lib/libstdc++.so.6" \
+                -b "${PREFIX}/lib/musl/libgcc_s.so.1:/usr/lib/libgcc_s.so.1" \
+                env -u LD_PRELOAD "$BIN" --version
+        fi
         exec env -u LD_PRELOAD "$BIN" --version
         ;;
     update|upgrade|-u|--update)
@@ -1204,6 +1265,18 @@ case "${1:-}" in
             fi
         fi
         sync_dispatcher
+        # proot-bind 模式: 二进制未打补丁, 靠 proot 把 musl loader 绑到标准路径
+        if [ "$(cat "$MODE_FILE" 2>/dev/null || echo native)" = "proot-bind" ] \
+           && command -v proot >/dev/null 2>&1; then
+            BINDS=(-b "${INTERP}:/lib/ld-musl-aarch64.so.1")
+            [ -f "${PREFIX}/lib/musl/libstdc++.so.6" ] \
+                && BINDS+=(-b "${PREFIX}/lib/musl/libstdc++.so.6:/usr/lib/libstdc++.so.6")
+            [ -f "${PREFIX}/lib/musl/libgcc_s.so.1" ] \
+                && BINDS+=(-b "${PREFIX}/lib/musl/libgcc_s.so.1:/usr/lib/libgcc_s.so.1")
+            [ -f "$PREFIX/etc/resolv.conf" ] \
+                && BINDS+=(-b "$PREFIX/etc/resolv.conf:/etc/resolv.conf")
+            exec proot "${BINDS[@]}" env -u LD_PRELOAD "$BIN" "$@"
+        fi
         # exec 不能调函数, 三个分支内联
         if have_root; then
             exec env -u LD_PRELOAD "$BIN" "$@"
@@ -1260,8 +1333,14 @@ DISP_EOF
 
 # ---------- 验证 ----------
 verify() {
-    local out
-    out=$(timeout 60 env -u LD_PRELOAD "$REAL_BIN" --version 2>&1 || true)
+    local out mode=""
+    mode="$(cat "$MODE_FILE" 2>/dev/null || echo native)"
+    if [ "$mode" = "proot-bind" ] && command -v proot >/dev/null 2>&1; then
+        # 未打补丁的二进制不能原生跑, 必须经 proot 绑定
+        out=$(proot_bind_run "$REAL_BIN" --version 2>&1 || true)
+    else
+        out=$(timeout 60 env -u LD_PRELOAD "$REAL_BIN" --version 2>&1 || true)
+    fi
     if printf '%s' "$out" | grep -qE '[0-9]+\.[0-9]+\.[0-9]+'; then
         ok "安装成功: qodercli $(printf '%s' "$out" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
     else
