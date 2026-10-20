@@ -403,6 +403,42 @@ proot_bind_run() {
     timeout 60 proot "${opts[@]}" env -u LD_PRELOAD "$bin" "$@"
 }
 
+# ---------- patchelf 补丁 (两种实现) ----------
+# Termux 默认的 patchelf 是 0.19.2, 它会把大体积 musl 二进制改坏: 退出码是 0
+# (看起来成功), 但产物一跑就 SIGSEGV。而 glibc 环境里的 patchelf 是 0.19.1,
+# 实测产物能原生直跑 (opencode V2 上验证过)。所以先试 bionic 版, 验证不过
+# 就上 glibc 版 —— native 模式比 proot-bind 快, 且不受 proot 那些限制。
+GLIBC_PATCHELF="$PREFIX/glibc/bin/patchelf"
+
+# 确保 glibc 版 patchelf 可用; 首次安装需下载约 33MB、占用约 214MB 磁盘
+install_glibc_patchelf() {
+    if command -v grun >/dev/null 2>&1 && [ -x "$GLIBC_PATCHELF" ]; then
+        return 0
+    fi
+    info "安装 glibc 版 patchelf (0.19.1, 能正确处理该二进制)…"
+    info "提示: 需下载约 33MB、占用约 214MB 磁盘, 首次会慢一些"
+    pkg install -y patchelf-glibc glibc glibc-runner gcc-libs-glibc >/dev/null 2>&1 || true
+    command -v grun >/dev/null 2>&1 && [ -x "$GLIBC_PATCHELF" ]
+}
+
+# 打补丁 + 试跑验证。$1=二进制 $2=未打补丁的原始副本 $3=bionic|glibc
+# 每次都从原始副本重新打, 避免上一次的坏产物残留。
+patch_and_verify() {
+    local bin="$1" orig="$2" kind="$3" out=""
+    local -a PE=(patchelf)
+    [ "$kind" = "glibc" ] && PE=(grun "$GLIBC_PATCHELF")
+
+    cp -f "$orig" "$bin" || return 1
+    "${PE[@]}" --set-interpreter "$INTERP" "$bin" 2>/dev/null || return 1
+    # musl loader 一定支持 DT_RPATH; DT_RUNPATH 取决于 musl 版本, 故强制 RPATH
+    "${PE[@]}" --force-rpath --set-rpath "$RUNPATH" "$bin" 2>/dev/null || return 1
+
+    # 不能写成 `cmd | grep -q`: grep 匹配到就退出, 写端被 SIGPIPE 杀掉,
+    # 在 pipefail 下整条管道算失败 → 误判。先捕获再匹配
+    out="$(env -u LD_PRELOAD "$bin" --version 2>&1)" || true
+    printf '%s' "$out" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+'
+}
+
 # ---------- 下载 → patchelf → 试跑 → 换入 ----------
 # 成功返回 0 并把新二进制安装到 $REAL_BIN; 失败返回 1 且不动现有版本
 install_qoder_binary() {
@@ -450,21 +486,13 @@ install_qoder_binary() {
     local mode=native
     cp "$new" "$work/qodercli.orig"   # 留一份未打补丁的
 
+    # 打补丁必须试跑验证: patchelf 0.19.2 退出码是 0 但产物是坏的
     info "改写 ELF: 解释器 → $INTERP; RPATH → $RUNPATH"
-    patchelf --set-interpreter "$INTERP" "$new" \
-        || warn "patchelf 设置解释器失败 (将改用 proot 绑定模式)"
-    # musl loader 一定支持 DT_RPATH; DT_RUNPATH 的支持取决于 musl 版本, 故强制 RPATH
-    patchelf --force-rpath --set-rpath "$RUNPATH" "$new" \
-        || warn "patchelf 设置 RPATH 失败 (将改用 proot 绑定模式)"
-
-    # 试跑: 必须清掉 LD_PRELOAD (termux-exec 的 ld-preload 是 bionic 链接, musl 加载会 exit 127)
-    # --version 不联网, 因此 DNS 未就绪也不会误判
-    info "试跑新二进制…"
-    # 注意: 不能写成 `cmd | grep -q` —— grep 匹配到就退出, 写端会被 SIGPIPE
-    # 杀掉, 在 pipefail 下整条管道算失败, 导致误判。先捕获再匹配。
-    local trial_out=""
-    trial_out="$(timeout 30 env -u LD_PRELOAD "$new" --version 2>&1)" || true
-    if ! printf '%s' "$trial_out" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+'; then
+    if patch_and_verify "$new" "$work/qodercli.orig" bionic; then
+        ok "补丁试跑通过 (bionic patchelf)"
+    elif install_glibc_patchelf && patch_and_verify "$new" "$work/qodercli.orig" glibc; then
+        ok "补丁试跑通过 (glibc 版 patchelf $(grun "$GLIBC_PATCHELF" --version 2>/dev/null | head -1))"
+    else
         warn "patchelf 后的二进制跑不起来 (Termux patchelf 0.19.2 会改坏大体积 musl 二进制)"
         info "改用 proot 绑定运行库模式 (二进制保持官方原样, 由 proot 绑 musl loader)"
         if ! command -v proot >/dev/null 2>&1; then
