@@ -71,7 +71,7 @@ qodercli                   # 同上，官方二进制原名
 qoder -p "1+1=?"           # 非交互单次提问
 qoder update               # 手动更新（启动本来就会自动检查）
 QODER_NO_AUTO_UPDATE=1 qoder   # 临时跳过启动前更新检查
-bash ~/.check_qoder_dns.sh     # DNS 一键诊断
+bash ~/.local/share/dns53/check_dns.sh    # DNS 一键诊断
 bash <(curl -fsSL …/install.sh) --uninstall   # 卸载
 ```
 
@@ -99,21 +99,20 @@ Android 没有 `/etc/resolv.conf`，musl 解析器会回退到 `127.0.0.1:53`，
 - **有 root**：转发器监听 `127.0.0.1:53`，自动探测手机当前 DNS（运营商下发）优先转发，公共 DNS 兜底，坏应答自动降级，默认屏蔽 AAAA 规避 IPv6 黑洞，全部 UDP 上游被封时回退系统 netd 解析。
 - **无 root**：绑不了 53 端口，改用 `dns-bootstrap.js` 实测候选 DNS 的应答质量（SERVFAIL / 空应答 / 只回 CNAME 全部判废），只把可用的写进 `$PREFIX/etc/resolv.conf`，再由 wrapper 用 proot 绑定给 musl 读取。
 
-**与其他项目共存**（重要）：
+**独立组件**（重要）：
 
-- 转发器文件仍叫 `dns53.js`，这样 codex-termux / opencode-termux 的 `pgrep -f "dns5[3].js"` 也能识别到它，不会重复拉起第二个实例抢 53 端口。
-- 本脚本把它放在 `~/.qoder/bin/dns53.js`，**不会覆盖**其他项目装在 `~/.local/bin/dns53.js` 的版本；若那份已存在则直接复用。
-- 若 `127.0.0.1:53` 已有服务在跑（`ss`/`lsof`/真实发包三重探测），整段 DNS 安装直接跳过。
-- 卸载只按 `# >>> qoder-dns >>>` / `# <<< qoder-dns <<<` marker 整段删除 bashrc 块，不会误删其他项目写的行。
+- DNS 组件安装在 `~/.local/share/dns53`，与 codex-termux / opencode-termux 共用同一份，不属于任何 agent 目录。
+- 升级安装时会自动清理旧版放在 `~/.qoder/bin/dns53.js`、`qoder-dnsq.js`、`qoder-dns-bootstrap.js` 的文件和 `.bashrc` 里的 `# >>> qoder-dns >>>` 块。
+- 删除 `~/.qoder` 不会影响 DNS；卸载本仓库也不会停掉其他项目共用的转发器。
 
-日志：`~/.qoder/dns53.log`；诊断：`bash ~/.check_qoder_dns.sh`。
+日志：`~/.local/share/dns53/logs/dns53.log`；诊断：`bash ~/.local/share/dns53/check_dns.sh`。
 
 ## 常见问题
 
 | 症状 | 原因 | 解决 |
 |---|---|---|
 | `Error relocating … __register_atfork: symbol not found` + `exit 127` | termux-exec 的 `LD_PRELOAD` 被 musl loader 加载 | wrapper 已 `unset LD_PRELOAD`；若你绕过 wrapper 直接跑二进制，需自行 `env -u LD_PRELOAD` |
-| 每次请求恰好卡 5 秒 | DNS 链没通 | 跑 `bash ~/.check_qoder_dns.sh`；重开终端让转发器拉起 |
+| 每次请求恰好卡 5 秒 | DNS 链没通 | 跑 `bash ~/.local/share/dns53/check_dns.sh`；重开终端让转发器拉起 |
 | `No command qoder found` | `~/.local/bin` 不在 PATH | 脚本已写入 `~/.bashrc`，重开终端或 `export PATH="$HOME/.local/bin:$PATH"` |
 | `qodercli` 能用但 `qoder` 不行 | 官方 dispatcher 还没生成 | 跑一次 `qodercli --version` 后重跑本脚本同步 |
 | `ide` / `chat` / `serve-web` 不可用 | Termux 上没有 Qoder IDE | 预期行为，回退 dispatcher 会明确报错 |
@@ -131,9 +130,7 @@ Android 没有 `/etc/resolv.conf`，musl 解析器会回退到 `127.0.0.1:53`，
 | `~/.qoder/bin/qodercli/.version` | 已安装版本号 |
 | `~/.local/bin/qodercli` | 启动 wrapper |
 | `~/.local/bin/qoder` | 官方 dispatcher（从 `~/.qoder/entry/qoder` 同步） |
-| `~/.qoder/bin/dns53.js`、`qoder-dnsq.js`、`qoder-dns-bootstrap.js` | DNS 组件 |
-| `~/.check_qoder_dns.sh` | DNS 诊断脚本 |
-| `~/.qoder/dns53.log` | 转发器日志 |
+| `~/.local/share/dns53/` | dns53 独立组件（与 codex/opencode 共用） |
 | `$PREFIX/lib/ld-musl-aarch64.so.1`、`$PREFIX/lib/musl/` | musl 运行时（与其他项目共用） |
 
 卸载**保留** `~/.qoder` 下的配置与登录态；如需彻底删除：`rm -rf ~/.qoder`。
@@ -143,7 +140,7 @@ Android 没有 `/etc/resolv.conf`，musl 解析器会回退到 `127.0.0.1:53`，
 这三个项目解决的是同一类问题（在 Termux 上跑官方 musl CLI），共用以下约定，装任意组合都不会冲突：
 
 - musl 运行时路径：`$PREFIX/lib/ld-musl-aarch64.so.1` + `$PREFIX/lib/musl/{libstdc++.so.6,libgcc_s.so.1}`
-- DNS 转发器：都叫 `dns53.js`，靠 `pgrep` 互认，避免重复占用 53 端口
+- DNS：统一使用独立组件 `~/.local/share/dns53`，多项目共用一份，不会互相覆盖
 - 本脚本的 patchelf 步骤用 `--force-rpath`（其他项目用的是 `--set-rpath`），因为 musl 对 `DT_RPATH` 的支持是确定的
 
 ## 许可证
