@@ -31,18 +31,17 @@
 
 ## 一行命令安装
 
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/xkxxs/Qoder-CLI-Termux/main/install.sh)
-```
-
-国内网络常常拉不动 `raw.githubusercontent.com`（时好时坏或直接超时），改用镜像：
+优先用 gh-proxy（实时转发，不走 CDN 缓存）；拉不动时依次换 jsDelivr（约 12 小时缓存）或 GitHub 直连：
 
 ```bash
-# jsDelivr CDN
+# 推荐: gh-proxy
+bash <(curl -fsSL https://gh-proxy.com/https://raw.githubusercontent.com/xkxxs/Qoder-CLI-Termux/main/install.sh)
+
+# 备选 1: jsDelivr CDN (约 12 小时缓存, 新提交可能延迟)
 bash <(curl -fsSL https://cdn.jsdelivr.net/gh/xkxxs/Qoder-CLI-Termux@main/install.sh)
 
-# 或 gh-proxy
-bash <(curl -fsSL https://gh-proxy.com/https://raw.githubusercontent.com/xkxxs/Qoder-CLI-Termux/main/install.sh)
+# 备选 2: GitHub 直连 (国内可能超时)
+bash <(curl -fsSL https://raw.githubusercontent.com/xkxxs/Qoder-CLI-Termux/main/install.sh)
 ```
 
 > 镜像只是搬运 `install.sh` 本身；脚本安装的 Qoder CLI 二进制来自官方 OSS
