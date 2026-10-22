@@ -113,7 +113,7 @@ Android 没有 `/etc/resolv.conf`，musl 解析器会回退到 `127.0.0.1:53`，
 |---|---|---|
 | `Error relocating … __register_atfork: symbol not found` + `exit 127` | termux-exec 的 `LD_PRELOAD` 被 musl loader 加载 | wrapper 已 `unset LD_PRELOAD`；若你绕过 wrapper 直接跑二进制，需自行 `env -u LD_PRELOAD` |
 | 每次请求恰好卡 5 秒 | DNS 链没通 | 跑 `bash ~/.local/share/dns53/check_dns.sh`；重开终端让转发器拉起 |
-| `No command qoder found` | `~/.local/bin` 不在 PATH | 脚本已写入 `~/.bashrc`，重开终端或 `export PATH="$HOME/.local/bin:$PATH"` |
+| `No command qoder found` | `~/.local/bin` 不在 PATH | 脚本已写入 `~/.bashrc`（默认 shell 为 zsh 时同时写入 `~/.zshrc`），重开终端或 `export PATH="$HOME/.local/bin:$PATH"` |
 | `qodercli` 能用但 `qoder` 不行 | 官方 dispatcher 还没生成 | 跑一次 `qodercli --version` 后重跑本脚本同步 |
 | `ide` / `chat` / `serve-web` 不可用 | Termux 上没有 Qoder IDE | 预期行为，回退 dispatcher 会明确报错 |
 | 更新很慢 | 每次更新要下 74MB | 用 `QODER_NO_AUTO_UPDATE=1` 跳过自动检查，需要时再手动 `qoder update` |
