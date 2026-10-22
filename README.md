@@ -3,7 +3,7 @@
 在 Termux (Android ARM64) 上安装**官方** Qoder CLI —— 二进制零修改、不装 Ubuntu、不用 proot-distro。
 
 > Qoder 官方其实发布了 `linux/arm64-musl` 变体，但官方一键脚本在 Termux 上会误选 **glibc** 变体，必然跑不起来。
-> 本脚本从官方 manifest 手动选 musl 变体，再用 patchelf 改写解释器与 RPATH，让它跑在 Termux 上。
+> 本脚本从官方 manifest 手动选 musl 变体，再用 patchelf 只改写解释器（不设 RPATH），运行库由 wrapper 通过 `LD_LIBRARY_PATH` 提供。
 
 ## 为什么官方一键脚本在 Termux 上必然失败
 
@@ -55,10 +55,10 @@ bash <(curl -fsSL https://gh-proxy.com/https://raw.githubusercontent.com/xkxxs/Q
 | 步骤 | 说明 |
 |---|---|
 | 环境检查 | 仅支持 Termux + aarch64；预检磁盘空间 |
-| 依赖 | `patchelf`、`tar`、`nodejs-lts`（DNS 转发器需要）、`sudo`；无 root 时补 `proot` |
+| 依赖 | `patchelf`、`tar`、`nodejs-lts`（DNS 转发器需要）、`sudo`；`proot`（无 root 时运行，有 root 时作 dns53 失联的 DNS 兜底） |
 | musl 运行库 | 从 Alpine 取 `musl` / `libgcc` / `libstdc++` 三个 apk，装到 `$PREFIX/lib/ld-musl-aarch64.so.1` 与 `$PREFIX/lib/musl/`。**已存在则跳过**（与 opencode-termux 共用同一套路径） |
 | DNS 修复 | 见下方「DNS」 |
-| 安装 Qoder CLI | 读官方 manifest → 取 `linux/arm64-musl` 的 url + sha256 → 下载校验 → 解压 → patchelf ×2 → **试跑验证通过才换入** |
+| 安装 Qoder CLI | 读官方 manifest → 取 `linux/arm64-musl` 的 url + sha256 → 下载校验 → 解压 → patchelf 只改解释器 → **试跑验证通过才换入** |
 | 生成 wrapper | `~/.local/bin/qodercli`：清 `LD_PRELOAD`、注入证书、处理 DNS/proot、启动前自动检查更新 |
 | 生成 dispatcher | 复制官方 `~/.qoder/entry/qoder` → `~/.local/bin/qoder` |
 | 验证 | `qodercli --version` |
@@ -84,12 +84,12 @@ bash <(curl -fsSL …/install.sh) --uninstall   # 卸载
 1. 读 `https://qoder-ide.oss-accelerate.aliyuncs.com/qodercli/channels/manifest.json`，取 `latest` 与 `os=linux, arch=arm64-musl` 条目的 `url` / `sha256`（纯 bash 解析，不依赖 jq/node）。
 2. 下载（74MB）→ sha256 校验 → 解压出 `qodercli`（171MB）。
 3. `patchelf --set-interpreter $PREFIX/lib/ld-musl-aarch64.so.1` —— 原来的 `/lib/ld-musl-aarch64.so.1` 在 Android 上不存在。
-4. `patchelf --force-rpath --set-rpath "$PREFIX/lib/musl:$PREFIX/lib"` —— musl 的 loader **一定支持 `DT_RPATH`**，而 `DT_RUNPATH` 的支持取决于 musl 版本，所以强制 RPATH。`$PREFIX/lib` 也要带上，因为 `libc.musl-aarch64.so.1` 在那里。
+4. **不设 RPATH**：`rpath + musl + Android` 会让这个二进制一启动就 SIGSEGV（实测 exit 139；patchelf 0.19.2 与 glibc 版 0.19.1 结果相同，与版本无关）。运行库改由 wrapper 注入 `LD_LIBRARY_PATH=$PREFIX/lib/musl:$PREFIX/lib`，效果等价且不会破坏二进制。
 5. 试跑 `qodercli --version`，输出匹配版本号才 `mv` 换入（同一分区内是原子 rename，不会留下半截文件）。
 6. wrapper 做三件事：
    - **`unset LD_PRELOAD`**：termux-exec 注入的 `libtermux-exec-ld-preload.so` 是 bionic 链接的，musl loader 加载它会报一堆 `Error relocating __register_atfork …` 并 `exit 127`。这是本方案最容易踩的坑。
    - `export SSL_CERT_FILE`：musl 二进制不认 Android 的 CA 路径。
-   - 有 root 直跑；无 root 用 `proot -b $PREFIX/etc/resolv.conf:/etc/resolv.conf`。
+   - 有 root 时注入 `LD_LIBRARY_PATH` 原生直跑（root 后端自动探测 direct / sudo / su）；无 root 用 `proot -b $PREFIX/etc/resolv.conf:/etc/resolv.conf`。
 7. `qoder` 是官方的 "Qoder Command Dispatcher"（不是二进制本体），它按 `type -P qodercli` → `~/.local/bin/qodercli` → `~/.qoder/bin/qodercli/qodercli` 顺序查找 CLI。该脚本由二进制首次运行时生成到 `~/.qoder/entry/qoder`，本脚本把它同步到 PATH，并在每次启动时比对（升级后官方会重写它）。
 
 ## DNS
@@ -141,7 +141,7 @@ Android 没有 `/etc/resolv.conf`，musl 解析器会回退到 `127.0.0.1:53`，
 
 - musl 运行时路径：`$PREFIX/lib/ld-musl-aarch64.so.1` + `$PREFIX/lib/musl/{libstdc++.so.6,libgcc_s.so.1}`
 - DNS：统一使用独立组件 `~/.local/share/dns53`，多项目共用一份，不会互相覆盖
-- 本脚本的 patchelf 步骤用 `--force-rpath`（其他项目用的是 `--set-rpath`），因为 musl 对 `DT_RPATH` 的支持是确定的
+- 所有项目都**不设 RPATH**：musl + Android 下 `--set-rpath` 会让二进制 SIGSEGV，运行库统一用 `LD_LIBRARY_PATH`（Qoder 1.1.76 实测：只改 interpreter → rc=0，加 rpath → rc=139）
 
 ## 许可证
 

@@ -11,7 +11,7 @@
 #
 #   官方其实也发布 linux/arm64-musl 变体 (见 manifest.json), 本脚本:
 #     1. 从官方 manifest 取 latest 与 linux/arm64-musl 的 url + sha256
-#     2. 下载并校验 → 解压 → patchelf 改写解释器 + RPATH → 试跑验证 → 换入
+#     2. 下载并校验 → 解压 → patchelf 只改解释器（不设 RPATH）→ 试跑验证 → 换入
 #     3. 生成 wrapper (处理 LD_PRELOAD / 证书 / DNS / 自动更新) 与 qoder dispatcher
 #
 # 用法:
@@ -46,7 +46,8 @@ ASSET="qodercli-linux-arm64-musl.tar.gz"
 # musl 运行时: 解释器 + 库目录 (与 opencode-termux 共用同一套路径约定, 已存在则复用)
 INTERP="$PREFIX/lib/ld-musl-aarch64.so.1"
 LIB_DIR="$PREFIX/lib/musl"
-RUNPATH="$LIB_DIR:$PREFIX/lib"
+# 运行库搜索路径: 只用于 LD_LIBRARY_PATH, 绝不能写进 ELF 的 rpath
+MUSL_LIBS="$LIB_DIR:$PREFIX/lib"
 # Alpine 镜像 (动态解析版本, 不硬编码 — 见下方 Alpine 源说明)
 ALPINE_MIRRORS=(
     "https://mirrors.tuna.tsinghua.edu.cn/alpine/latest-stable/main/aarch64"
@@ -388,14 +389,14 @@ verify_sha256() {
     [ "$got" = "$expect" ]
 }
 
-# ---------- proot 绑定运行 (patchelf 靠不住时的兜底) ----------
-# Termux 的 patchelf 0.19.2 会把某些大体积 musl 二进制改坏 (打完补丁一跑就
-# SIGSEGV, opencode V2 上已复现)。此时二进制保持官方原样, 由 proot 把 musl
-# loader / 运行库绑到它原本要找的标准路径 —— 完全不需要 patchelf。
+# ---------- proot 绑定运行 (patch 后仍跑不起来时的兜底) ----------
+# 正常路径是"只改 interpreter + LD_LIBRARY_PATH"原生直跑。只有它在某些
+# 设备/内核上仍失败时, 才保留官方二进制、由 proot 把 musl loader / 运行库
+# 绑到它原本要找的标准路径 —— 这条路径完全不需要 patchelf。
 proot_bind_run() {
     local bin="$1"; shift
     local opts=(-b "${INTERP}:/lib/ld-musl-aarch64.so.1")
-    # 注意: RUNPATH 是冒号分隔的列表 ("$LIB_DIR:$PREFIX/lib"), 不能拿它拼
+    # 注意: MUSL_LIBS 是冒号分隔的列表 ("$LIB_DIR:$PREFIX/lib"), 不能拿它拼
     # 文件路径, 必须用单个目录 LIB_DIR
     if [ -f "${LIB_DIR}/libstdc++.so.6" ]; then
         opts+=(-b "${LIB_DIR}/libstdc++.so.6:/usr/lib/libstdc++.so.6")
@@ -410,39 +411,19 @@ proot_bind_run() {
     timeout 60 proot "${opts[@]}" env -u LD_PRELOAD "$bin" "$@"
 }
 
-# ---------- patchelf 补丁 (两种实现) ----------
-# Termux 默认的 patchelf 是 0.19.2, 它会把大体积 musl 二进制改坏: 退出码是 0
-# (看起来成功), 但产物一跑就 SIGSEGV。而 glibc 环境里的 patchelf 是 0.19.1,
-# 实测产物能原生直跑 (opencode V2 上验证过)。所以先试 bionic 版, 验证不过
-# 就上 glibc 版 —— native 模式比 proot-bind 快, 且不受 proot 那些限制。
-GLIBC_PATCHELF="$PREFIX/glibc/bin/patchelf"
-
-# 确保 glibc 版 patchelf 可用; 首次安装需下载约 33MB、占用约 214MB 磁盘
-install_glibc_patchelf() {
-    if command -v grun >/dev/null 2>&1 && [ -x "$GLIBC_PATCHELF" ]; then
-        return 0
-    fi
-    info "安装 glibc 版 patchelf (0.19.1, 能正确处理该二进制)…"
-    info "提示: 需下载约 33MB、占用约 214MB 磁盘, 首次会慢一些"
-    pkg install -y patchelf-glibc glibc glibc-runner gcc-libs-glibc >/dev/null 2>&1 || true
-    command -v grun >/dev/null 2>&1 && [ -x "$GLIBC_PATCHELF" ]
-}
-
-# 打补丁 + 试跑验证。$1=二进制 $2=未打补丁的原始副本 $3=bionic|glibc
-# 每次都从原始副本重新打, 避免上一次的坏产物残留。
+# ---------- patchelf 补丁 ----------
+# 只改 interpreter, 绝对不要 --set-rpath:
+#   rpath + musl + Android 会让这个 167MB 的 Bun 二进制一跑就 SIGSEGV
+#   (实测 exit 139; patchelf 0.19.2 / glibc 0.19.1 都一样, 与版本无关)。
+# 运行库改由 wrapper 用 LD_LIBRARY_PATH=$MUSL_LIBS 提供。
+# 每次从原始副本重打, 避免上一次的坏产物残留。
 patch_and_verify() {
-    local bin="$1" orig="$2" kind="$3" out=""
-    local -a PE=(patchelf)
-    [ "$kind" = "glibc" ] && PE=(grun "$GLIBC_PATCHELF")
-
+    local bin="$1" orig="$2" out=""
     cp -f "$orig" "$bin" || return 1
-    "${PE[@]}" --set-interpreter "$INTERP" "$bin" 2>/dev/null || return 1
-    # musl loader 一定支持 DT_RPATH; DT_RUNPATH 取决于 musl 版本, 故强制 RPATH
-    "${PE[@]}" --force-rpath --set-rpath "$RUNPATH" "$bin" 2>/dev/null || return 1
-
+    patchelf --set-interpreter "$INTERP" "$bin" 2>/dev/null || return 1
     # 不能写成 `cmd | grep -q`: grep 匹配到就退出, 写端被 SIGPIPE 杀掉,
     # 在 pipefail 下整条管道算失败 → 误判。先捕获再匹配
-    out="$(env -u LD_PRELOAD "$bin" --version 2>&1)" || true
+    out="$(env -u LD_PRELOAD LD_LIBRARY_PATH="$MUSL_LIBS" "$bin" --version 2>&1)" || true
     printf '%s' "$out" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+'
 }
 
@@ -456,8 +437,11 @@ install_qoder_binary() {
     info "官方最新版: v$latest"
 
     cur="$(cat "$VERSION_FILE" 2>/dev/null || true)"
+    # 旧版安装可能被写入了 rpath (会导致 SIGSEGV), 必须重下重打; 只检查版本号
+    # 会直接跳过, 把有问题的二进制留在原地。
     if [ "$force" != "1" ] && [ -n "$cur" ] && [ "$(printf '%s\n%s\n' "$cur" "$latest" | sort -V | tail -n1)" = "$cur" ] \
-       && [ -x "$REAL_BIN" ] && patchelf --print-interpreter "$REAL_BIN" 2>/dev/null | grep -q 'ld-musl'; then
+       && [ -x "$REAL_BIN" ] && patchelf --print-interpreter "$REAL_BIN" 2>/dev/null | grep -q 'ld-musl' \
+       && [ -z "$(patchelf --print-rpath "$REAL_BIN" 2>/dev/null || true)" ]; then
         ok "已是最新版 v$cur 且解释器正确, 跳过下载"
         return 0
     fi
@@ -493,14 +477,12 @@ install_qoder_binary() {
     local mode=native
     cp "$new" "$work/qodercli.orig"   # 留一份未打补丁的
 
-    # 打补丁必须试跑验证: patchelf 0.19.2 退出码是 0 但产物是坏的
-    info "改写 ELF: 解释器 → $INTERP; RPATH → $RUNPATH"
-    if patch_and_verify "$new" "$work/qodercli.orig" bionic; then
-        ok "补丁试跑通过 (bionic patchelf)"
-    elif install_glibc_patchelf && patch_and_verify "$new" "$work/qodercli.orig" glibc; then
-        ok "补丁试跑通过 (glibc 版 patchelf $(grun "$GLIBC_PATCHELF" --version 2>/dev/null | head -1))"
+    # 只改 interpreter; 打完必须试跑 (退出码 0 也可能是坏产物)
+    info "改写 ELF: 解释器 → $INTERP (不设 RPATH)"
+    if patch_and_verify "$new" "$work/qodercli.orig"; then
+        ok "补丁试跑通过 (patchelf $(patchelf --version 2>/dev/null | head -1))"
     else
-        warn "patchelf 后的二进制跑不起来 (Termux patchelf 0.19.2 会改坏大体积 musl 二进制)"
+        warn "patchelf 后的二进制跑不起来"
         info "改用 proot 绑定运行库模式 (二进制保持官方原样, 由 proot 绑 musl loader)"
         if ! command -v proot >/dev/null 2>&1; then
             info "安装 proot…"
@@ -630,7 +612,7 @@ MANIFEST_URL="https://qoder-ide.oss-accelerate.aliyuncs.com/qodercli/channels/ma
 RELEASE_BASE="https://qoder-ide.oss-accelerate.aliyuncs.com/qodercli/releases"
 ASSET="qodercli-linux-arm64-musl.tar.gz"
 INTERP="$PREFIX/lib/ld-musl-aarch64.so.1"
-RUNPATH="$PREFIX/lib/musl:$PREFIX/lib"
+MUSL_LIBS="$PREFIX/lib/musl:$PREFIX/lib"
 
 export SSL_CERT_FILE="${SSL_CERT_FILE:-$PREFIX/etc/tls/cert.pem}"
 unset LD_PRELOAD
@@ -715,8 +697,8 @@ do_update() {
     [ -n "$new" ] && [ -f "$new" ] || { echo "!! 包内未找到 qodercli" >&2; return 1; }
     chmod 755 "$new"
     patchelf --set-interpreter "$INTERP" "$new" || { echo "!! patchelf 失败" >&2; return 1; }
-    patchelf --force-rpath --set-rpath "$RUNPATH" "$new" || { echo "!! patchelf 失败" >&2; return 1; }
-    if ! timeout 30 env -u LD_PRELOAD "$new" --version 2>&1 | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+'; then
+    # 不设 rpath: rpath + musl 在 Android 会 SIGSEGV, 运行库走 LD_LIBRARY_PATH
+    if ! timeout 30 env -u LD_PRELOAD LD_LIBRARY_PATH="$MUSL_LIBS" "$new" --version 2>&1 | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+'; then
         echo "!! 新版本试跑失败, 旧版保留" >&2; return 1
     fi
     mkdir -p "$(dirname "$BIN")"
@@ -745,9 +727,9 @@ case "${1:-}" in
             exec proot -b "${INTERP}:/lib/ld-musl-aarch64.so.1" \
                 -b "${PREFIX}/lib/musl/libstdc++.so.6:/usr/lib/libstdc++.so.6" \
                 -b "${PREFIX}/lib/musl/libgcc_s.so.1:/usr/lib/libgcc_s.so.1" \
-                env -u LD_PRELOAD "$BIN" --version
+                env -u LD_PRELOAD LD_LIBRARY_PATH="$MUSL_LIBS" "$BIN" --version
         fi
-        exec env -u LD_PRELOAD "$BIN" --version
+        exec env -u LD_PRELOAD LD_LIBRARY_PATH="$MUSL_LIBS" "$BIN" --version
         ;;
     update|upgrade|-u|--update)
         shift || true
@@ -782,7 +764,7 @@ case "${1:-}" in
                 && BINDS+=(-b "${PREFIX}/lib/musl/libgcc_s.so.1:/usr/lib/libgcc_s.so.1")
             [ -f "$PREFIX/etc/resolv.conf" ] \
                 && BINDS+=(-b "$PREFIX/etc/resolv.conf:/etc/resolv.conf")
-            exec proot "${BINDS[@]}" env -u LD_PRELOAD "$BIN" "$@"
+            exec proot "${BINDS[@]}" env -u LD_PRELOAD LD_LIBRARY_PATH="$MUSL_LIBS" "$BIN" "$@"
         fi
         # exec 不能调函数, 三个分支内联
         # root 分支: dns53 常驻在 127.0.0.1:53。用心跳判断它是否真的在跑 ——
@@ -794,7 +776,7 @@ case "${1:-}" in
                 sleep 1
             fi
             if dns53_alive; then
-                exec env -u LD_PRELOAD "$BIN" "$@"
+                exec env -u LD_PRELOAD LD_LIBRARY_PATH="$MUSL_LIBS" "$BIN" "$@"
             fi
             # dns53 仍未起来: 127.0.0.1:53 无人监听, 改用 proot 绑 resolv.conf
             if command -v proot >/dev/null 2>&1; then
@@ -802,23 +784,23 @@ case "${1:-}" in
                     node "$DNS53_DIR/dns-bootstrap.js" >/dev/null 2>&1 || true
                 fi
                 if [ -f "$PREFIX/etc/resolv.conf" ]; then
-                    exec proot -b "$PREFIX/etc/resolv.conf:/etc/resolv.conf" env -u LD_PRELOAD "$BIN" "$@"
+                    exec proot -b "$PREFIX/etc/resolv.conf:/etc/resolv.conf" env -u LD_PRELOAD LD_LIBRARY_PATH="$MUSL_LIBS" "$BIN" "$@"
                 fi
                 # 极少数情况: bootstrap 没能写出 resolv.conf —— 仍走 proot, 不原生直跑
-                exec proot env -u LD_PRELOAD "$BIN" "$@"
+                exec proot env -u LD_PRELOAD LD_LIBRARY_PATH="$MUSL_LIBS" "$BIN" "$@"
             fi
             # proot 不可用: 原生直跑是唯一选择
-            exec env -u LD_PRELOAD "$BIN" "$@"
+            exec env -u LD_PRELOAD LD_LIBRARY_PATH="$MUSL_LIBS" "$BIN" "$@"
         elif command -v proot >/dev/null 2>&1; then
             if [ ! -f "$PREFIX/etc/resolv.conf" ] && [ -f "$DNSBOOT" ]; then
                 node "$DNSBOOT" >/dev/null 2>&1 || true
             fi
             if [ -f "$PREFIX/etc/resolv.conf" ]; then
-                exec proot -b "$PREFIX/etc/resolv.conf:/etc/resolv.conf" env -u LD_PRELOAD "$BIN" "$@"
+                exec proot -b "$PREFIX/etc/resolv.conf:/etc/resolv.conf" env -u LD_PRELOAD LD_LIBRARY_PATH="$MUSL_LIBS" "$BIN" "$@"
             fi
-            exec env -u LD_PRELOAD "$BIN" "$@"
+            exec env -u LD_PRELOAD LD_LIBRARY_PATH="$MUSL_LIBS" "$BIN" "$@"
         else
-            exec env -u LD_PRELOAD "$BIN" "$@"
+            exec env -u LD_PRELOAD LD_LIBRARY_PATH="$MUSL_LIBS" "$BIN" "$@"
         fi
         ;;
 esac
@@ -868,7 +850,7 @@ verify() {
         # 未打补丁的二进制不能原生跑, 必须经 proot 绑定
         out=$(proot_bind_run "$REAL_BIN" --version 2>&1 || true)
     else
-        out=$(timeout 60 env -u LD_PRELOAD "$REAL_BIN" --version 2>&1 || true)
+        out=$(timeout 60 env -u LD_PRELOAD LD_LIBRARY_PATH="$MUSL_LIBS" "$REAL_BIN" --version 2>&1 || true)
     fi
     if printf '%s' "$out" | grep -qE '[0-9]+\.[0-9]+\.[0-9]+'; then
         ok "安装成功: qodercli $(printf '%s' "$out" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
