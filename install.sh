@@ -66,7 +66,18 @@ info() { echo -e "${BLU}▸${NC} $*"; }
 warn() { echo -e "${YEL}⚠${NC} $*"; }
 fail() { echo -e "${RED}✗${NC} $*"; exit 1; }
 
-have_root() { command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; }
+# root 判定: 有 root 不等于装了 Termux 的 sudo 包 (Magisk/KernelSU 只提供 su)。
+# 顺序: 本身已是 root → sudo -n → su -c 'id -u' (Magisk 首次会弹授权, 故加 timeout)。
+have_root() {
+    [ "$(id -u 2>/dev/null)" = 0 ] && return 0
+    command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null && return 0
+    if command -v su >/dev/null 2>&1; then
+        local u
+        u="$(timeout 5 su -c 'id -u' 2>/dev/null | tr -d '\r' | head -n 1 || true)"
+        [ "$u" = 0 ] && return 0
+    fi
+    return 1
+}
 
 # ---------- 环境检查 ----------
 check_environment() {
@@ -243,7 +254,10 @@ install_dependencies() {
     else
         ok "依赖已就绪"
     fi
-    if ! have_root; then
+    if have_root; then
+        # 有 root 也要 proot: dns53 挂掉时它是 DNS 的兜底 (绑 $PREFIX/etc/resolv.conf)
+        command -v proot >/dev/null 2>&1 || { info "安装 proot (dns53 不可用时的 DNS 兜底)…"; pkg install -y proot; }
+    else
         command -v proot >/dev/null 2>&1 || { info "未检测到 root, 安装 proot (用于绑定 resolv.conf)…"; pkg install -y proot; }
         warn "未检测到 root: 将通过 proot 绑定 resolv.conf (每次调用多 100~300ms)"
     fi
@@ -525,7 +539,7 @@ DNS53_RAW_BASES=(
     "https://cdn.jsdelivr.net/gh/xkxxs/Qoder-CLI-Termux@main/dns53"
     "https://raw.githubusercontent.com/xkxxs/Qoder-CLI-Termux/main/dns53"
 )
-DNS53_FILES=(install.sh VERSION dns53.js dns-bootstrap.js dnsq.js check_dns.sh dns53-aaaa)
+DNS53_FILES=(install.sh VERSION root.sh dns53.js dns-bootstrap.js dnsq.js check_dns.sh dns53-aaaa)
 
 # 旧版把 DNS 组件放在 ~/.qoder/bin 与 ~/.check_qoder_dns.sh, 统一迁移到独立组件
 cleanup_legacy_dns() {
@@ -621,7 +635,30 @@ RUNPATH="$PREFIX/lib/musl:$PREFIX/lib"
 export SSL_CERT_FILE="${SSL_CERT_FILE:-$PREFIX/etc/tls/cert.pem}"
 unset LD_PRELOAD
 
-have_root() { command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; }
+# root 判定: uid 0 / sudo -n / su -c 任一可用即为有 root
+# (Magisk/KernelSU 只装 su, 没有 Termux 的 sudo 包)
+have_root() {
+    [ "$(id -u 2>/dev/null)" = 0 ] && return 0
+    # root.sh 已探测过并缓存 (direct|sudo|su): 避免每次启动都 su 触发授权弹窗
+    if command -v dns53_have_root >/dev/null 2>&1 && dns53_have_root; then return 0; fi
+    command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null && return 0
+    if command -v su >/dev/null 2>&1; then
+        local u
+        u="$(timeout 5 su -c 'id -u' 2>/dev/null | tr -d '\r' | head -n 1 || true)"
+        [ "$u" = 0 ] && return 0
+    fi
+    return 1
+}
+
+# dns53 组件的 root 后端 (direct/sudo/su), 见 root.sh
+if [ -f "$DNS53_DIR/root.sh" ]; then
+    . "$DNS53_DIR/root.sh"
+    dns53_load_root_mode 0
+else
+    # 旧安装 (dns53 还没有 root.sh): 保留原有 sudo 行为
+    dns53_alive() { sudo -n pgrep -f 'dns5[3]\.js' >/dev/null 2>&1; }
+    dns53_root_exec() { sudo -n "$@"; }
+fi
 current_version() { cat "$VERSION_FILE" 2>/dev/null || true; }
 
 manifest_json() { curl -fsSL --connect-timeout 5 --max-time 12 "$MANIFEST_URL" 2>/dev/null || true; }
@@ -748,12 +785,29 @@ case "${1:-}" in
             exec proot "${BINDS[@]}" env -u LD_PRELOAD "$BIN" "$@"
         fi
         # exec 不能调函数, 三个分支内联
+        # root 分支: dns53 常驻在 127.0.0.1:53。用心跳判断它是否真的在跑 ——
+        # 只看 root 存在会误判: 有 root 但 dns53 挂了时原生直跑 = DNS 全挂。
         if have_root; then
-            if ! sudo -n pgrep -f "dns5[3].js" >/dev/null 2>&1 && [ -f "$DNS53_DIR/dns53.js" ]; then
+            if ! dns53_alive && [ -f "$DNS53_DIR/dns53.js" ]; then
                 mkdir -p "$DNS53_DIR/logs"
-                sudo -n nohup node "$DNS53_DIR/dns53.js" >> "$DNS53_DIR/logs/dns53.log" 2>&1 &
+                dns53_root_exec nohup node "$DNS53_DIR/dns53.js" >> "$DNS53_DIR/logs/dns53.log" 2>&1 &
                 sleep 1
             fi
+            if dns53_alive; then
+                exec env -u LD_PRELOAD "$BIN" "$@"
+            fi
+            # dns53 仍未起来: 127.0.0.1:53 无人监听, 改用 proot 绑 resolv.conf
+            if command -v proot >/dev/null 2>&1; then
+                if [ -f "$DNS53_DIR/dns-bootstrap.js" ]; then
+                    node "$DNS53_DIR/dns-bootstrap.js" >/dev/null 2>&1 || true
+                fi
+                if [ -f "$PREFIX/etc/resolv.conf" ]; then
+                    exec proot -b "$PREFIX/etc/resolv.conf:/etc/resolv.conf" env -u LD_PRELOAD "$BIN" "$@"
+                fi
+                # 极少数情况: bootstrap 没能写出 resolv.conf —— 仍走 proot, 不原生直跑
+                exec proot env -u LD_PRELOAD "$BIN" "$@"
+            fi
+            # proot 不可用: 原生直跑是唯一选择
             exec env -u LD_PRELOAD "$BIN" "$@"
         elif command -v proot >/dev/null 2>&1; then
             if [ ! -f "$PREFIX/etc/resolv.conf" ] && [ -f "$DNSBOOT" ]; then
