@@ -908,6 +908,11 @@ show_guide() {
     echo "    bash ~/.local/share/dns53/check_dns.sh    DNS 一键诊断"
     echo "    重跑本脚本 --uninstall        卸载"
     echo
+    echo "  建议的 Android 设置 (防止 Termux 被系统杀后台):"
+    echo "    1. 开发者选项 → 停止限制子进程: 开启"
+    echo "    2. 系统设置 → 应用 → Termux → 电池: 不优化"
+    echo "    3. 后台活动 / 自启动: 设为无限制"
+    echo
     echo "  注意: 本脚本只负责安装, 模型/账号配置请参考官方文档:"
     echo "    https://docs.qoder.com"
     echo "=============================================================="
